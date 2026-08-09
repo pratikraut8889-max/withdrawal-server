@@ -25,15 +25,9 @@ if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET || !process
 }
 
 // ─── Mock Payout Mode ────────────────────────────────────────────────
-// Set MOCK_PAYOUTS=true in .env to bypass real RazorpayX calls entirely.
-// Useful while RazorpayX isn't activated yet (e.g. account is still
-// "Individual" business type) — lets you test the full withdrawal flow
-// (auth, balance checks, coin reserve/commit/release, Firestore writes)
-// without touching the real API. Flip back to false/unset once RazorpayX
-// is live.
 const MOCK_PAYOUTS = process.env.MOCK_PAYOUTS === 'true';
 if (MOCK_PAYOUTS) {
-  console.log('🧪 MOCK_PAYOUTS is ON — Razorpay calls will be simulated, no real API calls made.');
+  console.log('🧪 MOCK_PAYOUTS is ON — Razorpay calls will be simulated.');
 }
 
 // ─── Firebase Admin SDK ──────────────────────────────────────────────
@@ -67,11 +61,6 @@ admin.initializeApp({
 const db = admin.firestore();
 
 // ─── RazorpayX REST Client ──────────────────────────────────────────
-// NOTE: The official `razorpay` npm SDK (v2.9.x) does NOT implement the
-// RazorpayX Contacts / Payouts resources (see razorpay/razorpay-node#396),
-// so those two calls are made directly against the REST API below.
-// `fundAccount` IS supported by the SDK, but we hit REST here too for
-// consistency and so all three calls share one error-handling path.
 const RAZORPAYX_BASE_URL = 'https://api.razorpay.com/v1';
 
 const razorpayXClient = axios.create({
@@ -97,35 +86,27 @@ async function verifyIdToken(idToken) {
   }
 }
 
-// ─── Helper: Refund coins after a payout that failed AFTER being committed ──
-// Only used for the async webhook case, where the deduction already happened
-// (payout looked successful when initiated, then RazorpayX reversed/rejected
-// it later). The synchronous failure path never deducts, so it never needs
-// this.
+// ─── Helper: Refund coins after a payout that failed after being committed ──
 async function refundCommittedCoins(userRef, coins, amount) {
   await userRef.update({
     totalCoins: admin.firestore.FieldValue.increment(coins),
     gameCoins: admin.firestore.FieldValue.increment(coins),
     totalWithdrawnCoins: admin.firestore.FieldValue.increment(-coins),
     totalWithdrawnAmount: admin.firestore.FieldValue.increment(-amount),
+    // Note: we do not adjust the source-specific withdrawn fields here,
+    // as refunds are exceptional; they can be handled manually if needed.
   });
 }
 
 // ─── Helper: Run the payout (real RazorpayX calls, or a mock) ───────
-// Returns { id } on success, throws on failure — mirrors the shape of
-// a real axios error (err.response.data.error.description) so the
-// catch block in the route doesn't need to know which mode is active.
 async function runPayout({ userData, phone, upiId, amount, coins, withdrawalId }) {
   if (MOCK_PAYOUTS) {
     console.log('🧪 [MOCK] Simulating payout...');
     console.log('   Amount:', amount * 100, 'paise (fake)');
     console.log('   UPI ID:', upiId);
 
-    // Simulate network/processing latency
     await new Promise((resolve) => setTimeout(resolve, 500));
 
-    // Set MOCK_FAIL_PAYOUTS=true in .env to test the failure/refund path
-    // instead of the success path.
     if (process.env.MOCK_FAIL_PAYOUTS === 'true') {
       const fakeError = new Error('Simulated payout failure');
       fakeError.response = {
@@ -159,7 +140,6 @@ async function runPayout({ userData, phone, upiId, amount, coins, withdrawalId }
   });
   console.log('   Contact created:', contact.id);
 
-  // NOTE: RazorpayX expects { address: upiId } here, not { vpa: upiId }.
   const { data: fundAccount } = await razorpayXClient.post('/fund_accounts', {
     contact_id: contact.id,
     account_type: 'vpa',
@@ -191,10 +171,14 @@ app.get('/health', (req, res) => {
 // ─── Withdrawal Endpoint ─────────────────────────────────────────────
 app.post('/api/withdraw', async (req, res) => {
   try {
-    const { idToken, coins, amount, upiId, phone } = req.body;
+    const { idToken, coins, amount, upiId, phone, source } = req.body;
 
-    if (!idToken || !coins || !amount || !upiId) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    if (!idToken || !coins || !amount || !upiId || !source) {
+      return res.status(400).json({ error: 'Missing required fields (idToken, coins, amount, upiId, source)' });
+    }
+
+    if (source !== 'game' && source !== 'referral') {
+      return res.status(400).json({ error: 'Invalid source. Must be "game" or "referral".' });
     }
 
     let decoded;
@@ -217,12 +201,7 @@ app.post('/api/withdraw', async (req, res) => {
       return res.status(400).json({ error: `Amount mismatch. Expected ₹${expectedAmount.toFixed(2)}` });
     }
 
-    // 1. Reserve the coins (does NOT deduct from gameCoins yet).
-    //    This is an atomic check-and-hold: it checks availableCoins
-    //    (gameCoins minus anything already reserved by other in-flight
-    //    withdrawals) inside the same transaction that places the hold,
-    //    so two concurrent withdrawal requests can't both pass the check
-    //    and over-withdraw.
+    // 1. Reserve the coins (atomic hold)
     try {
       await db.runTransaction(async (transaction) => {
         const snap = await transaction.get(userRef);
@@ -243,7 +222,7 @@ app.post('/api/withdraw', async (req, res) => {
       return res.status(400).json({ error: reserveError.message });
     }
 
-    // 2. Create withdrawal document (status: pending — no balance change yet)
+    // 2. Create withdrawal document (status: pending — includes source)
     const withdrawalRef = db.collection('withdrawals').doc();
     const withdrawalId = withdrawalRef.id;
     await withdrawalRef.set({
@@ -255,6 +234,7 @@ app.post('/api/withdraw', async (req, res) => {
       phone: phone || '',
       coins,
       amount,
+      source, // ← stores the source
       status: 'pending',
       paymentMode: 'UPI',
       transactionId: '',
@@ -263,7 +243,7 @@ app.post('/api/withdraw', async (req, res) => {
       error: null,
     });
 
-    // 3. Initiate Razorpay Payout (real RazorpayX REST API, or mock)
+    // 3. Initiate Razorpay Payout
     try {
       const payout = await runPayout({
         userData: { ...userData, uid },
@@ -274,8 +254,12 @@ app.post('/api/withdraw', async (req, res) => {
         withdrawalId,
       });
 
-      // Payout call succeeded — NOW commit the balance change: release the
-      // hold and actually deduct the coins in one atomic transaction.
+      // ─── Commit balance change ─────────────────────────────────────────
+      // Determine which withdrawn field to increment based on source
+      const withdrawnField = source === 'game' 
+        ? 'totalWithdrawnGameCoins' 
+        : 'totalWithdrawnReferralCoins';
+
       await db.runTransaction(async (transaction) => {
         transaction.update(userRef, {
           pendingWithdrawalCoins: admin.firestore.FieldValue.increment(-coins),
@@ -283,6 +267,8 @@ app.post('/api/withdraw', async (req, res) => {
           gameCoins: admin.firestore.FieldValue.increment(-coins),
           totalWithdrawnCoins: admin.firestore.FieldValue.increment(coins),
           totalWithdrawnAmount: admin.firestore.FieldValue.increment(amount),
+          // ✅ Increment the source-specific withdrawn field
+          [withdrawnField]: admin.firestore.FieldValue.increment(coins),
           lastWithdrawalAt: admin.firestore.FieldValue.serverTimestamp(),
         });
       });
@@ -300,7 +286,6 @@ app.post('/api/withdraw', async (req, res) => {
       });
 
     } catch (razorpayError) {
-      // Axios errors carry the real RazorpayX error body in .response.data
       const errMessage =
         razorpayError.response?.data?.error?.description ||
         razorpayError.message ||
@@ -311,9 +296,7 @@ app.post('/api/withdraw', async (req, res) => {
         console.error('   Details:', JSON.stringify(razorpayError.response.data));
       }
 
-      // Payout was never actually initiated, so the user's balance was
-      // never touched — just release the reservation. No refund needed
-      // because nothing was ever deducted.
+      // Release the reservation (no coins were deducted)
       try {
         await userRef.update({
           pendingWithdrawalCoins: admin.firestore.FieldValue.increment(-coins),
@@ -356,14 +339,10 @@ app.post('/webhook/razorpay', async (req, res) => {
         error: status !== 'processed' ? payout.failure_reason : null,
       });
 
-      // If RazorpayX later reports the payout as reversed/failed/cancelled
-      // (async, after we'd already committed the deduction and returned
-      // 'processing' to the client), refund the coins now — this is the
-      // one path where a real refund (not just a hold-release) is needed.
+      // Refund if the payout was later reversed/failed after we committed
       const terminalFailureStatuses = ['reversed', 'rejected', 'cancelled', 'failed'];
       if (terminalFailureStatuses.includes(status) && withdrawalSnap.exists) {
         const w = withdrawalSnap.data();
-        // Only refund once — guard against duplicate webhook deliveries.
         if (!w.refunded) {
           const userRef = db.collection('users').doc(w.uid);
           await refundCommittedCoins(userRef, w.coins, w.amount);
